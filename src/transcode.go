@@ -4,52 +4,37 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io/ioutil"
 	"os"
 )
 
 type Transcoder struct {
-	width, height uint32
-	bitDepth      BitDepth
-	colorType     ColorType
+	Width, Height uint32
+	BitDepth      BitDepth
+	ColorType     ColorType
 
-	filterer *AdaptiveFilter
+	// seenset keeps track of which index in data the ChunkTypes begin
+	// no support for multiple chunks of the same type yet
+	SeenSet map[string]uint32
+	Data    []byte
 
+	Filterer   *AdaptiveFilter
 	compressor Compresser
 	interlacer Interlacer
 }
 
+func (t *Transcoder) String() string {
+	return fmt.Sprintf("img W/H %vx%v BD/CT %v/%v SeenSet %v",
+		t.Width, t.Height, t.BitDepth, t.ColorType, t.SeenSet)
+}
+
 func (t *Transcoder) Transcode(raw, target string) string {
-	filtered := t.filterer.Filter(raw)
+	filtered := t.Filterer.Filter(raw)
 	compressed := t.compressor.Compress(filtered)
 
 	return compressed
 }
-
-var (
-	PNG_SIGNATURE = []byte{137, 80, 78, 71, 13, 10, 26, 10}
-)
-
-type ColorType uint16
-
-const (
-	CTUnknown ColorType = 0
-	CT2       ColorType = 2
-	CT3       ColorType = 3
-	CT4       ColorType = 4
-	CT6       ColorType = 6
-)
-
-type BitDepth uint16
-
-const (
-	BDUnknown BitDepth = 0
-	BD1       BitDepth = 1
-	BD2       BitDepth = 2
-	BD4       BitDepth = 4
-	BD8       BitDepth = 8
-	BD16      BitDepth = 16
-)
 
 func NewTranscoder(path string) (*Transcoder, error) {
 	f, err := os.Open(path)
@@ -67,31 +52,47 @@ func NewTranscoder(path string) (*Transcoder, error) {
 
 	//? todo: consider the very chaotic idea of making chunk processing
 	//? concurrent for the memes hehehe
-	t := &Transcoder{}
+	t := &Transcoder{
+		SeenSet: make(map[string]uint32),
+	}
 	var pos uint32 = 8
 	for {
+		if _, ok := t.SeenSet["IEND"]; ok {
+			break
+		}
+
+		loc := pos
 		length := binary.BigEndian.Uint32(b[pos : pos+4])
 		pos += 4
 		typ := b[pos : pos+4]
 		pos += 4
-		data := b[pos : pos+length]
+		chunk := b[pos : pos+length]
 		pos += length
 		crc := b[pos : pos+4]
 		pos += 4
 
-		t.processChunk(typ, data, crc)
+		err := t.initChunk(loc, typ, chunk, crc)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	return t, err
 }
 
-func (t *Transcoder) processChunk(typ, data, crc []byte) error {
+func (t *Transcoder) initChunk(loc uint32, typ, data, crc []byte) error {
+	if crc32.ChecksumIEEE(append(typ, data...)) != binary.BigEndian.Uint32(crc) {
+		return fmt.Errorf("crc32 failed for chunk %s (byte %v)", string(typ), loc)
+	}
+
 	switch string(typ) {
 	case "IHDR":
-		t.width = binary.BigEndian.Uint32(data[:4])
-		t.height = binary.BigEndian.Uint32(data[4:8])
+		t.Width = binary.BigEndian.Uint32(data[:4])
+		t.Height = binary.BigEndian.Uint32(data[4:8])
 
-		t.bitDepth = BitDepth(data[8])
-		t.colorType = ColorType(data[9])
-		if err := verifyBitDepthAndColorType(t.bitDepth, t.colorType); err != nil {
+		t.BitDepth = BitDepth(data[8])
+		t.ColorType = ColorType(data[9])
+		if err := verifyBitDepthAndColorType(t.BitDepth, t.ColorType); err != nil {
 			return err
 		}
 
@@ -106,7 +107,7 @@ func (t *Transcoder) processChunk(typ, data, crc []byte) error {
 		// Filter Method
 		switch data[11] {
 		case 0:
-			t.filterer = &AdaptiveFilter{}
+			t.Filterer = &AdaptiveFilter{}
 		default:
 			return fmt.Errorf("unsupported filter method: %v", data[11])
 		}
@@ -121,9 +122,17 @@ func (t *Transcoder) processChunk(typ, data, crc []byte) error {
 			return fmt.Errorf("unsupported interlace method : %v", data[12])
 		}
 	case "IDAT":
-	case "PLTE":
+		if _, ok := t.SeenSet["IHDR"]; !ok {
+			return fmt.Errorf("IDAT header declared before IHDR")
+		}
+		t.Data = data
+	case "IEND":
+		// only seenset is updated
+	default:
+		fmt.Printf("WARNING: unimplemented type %s\n", string(typ))
 	}
 
+	t.SeenSet[string(typ)] = loc
 	return nil
 }
 
