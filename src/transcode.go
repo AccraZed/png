@@ -16,8 +16,9 @@ type Transcoder struct {
 
 	// seenset keeps track of which index in data the ChunkTypes begin
 	// no support for multiple chunks of the same type yet
-	SeenSet map[string]uint32
-	Data    []byte
+	SeenSet   map[string]uint32
+	Data      []byte
+	DataState DataState
 
 	Filterer   *AdaptiveFilter
 	compressor Compresser
@@ -27,13 +28,6 @@ type Transcoder struct {
 func (t *Transcoder) String() string {
 	return fmt.Sprintf("img W/H %vx%v BD/CT %v/%v SeenSet %v",
 		t.Width, t.Height, t.BitDepth, t.ColorType, t.SeenSet)
-}
-
-func (t *Transcoder) Transcode(raw, target string) string {
-	filtered := t.Filterer.Filter(raw)
-	compressed := t.compressor.Compress(filtered)
-
-	return compressed
 }
 
 func NewTranscoder(path string) (*Transcoder, error) {
@@ -53,7 +47,8 @@ func NewTranscoder(path string) (*Transcoder, error) {
 	//? todo: consider the very chaotic idea of making chunk processing
 	//? concurrent for the memes hehehe
 	t := &Transcoder{
-		SeenSet: make(map[string]uint32),
+		SeenSet:   make(map[string]uint32),
+		DataState: DataStateCompressed,
 	}
 	var pos uint32 = 8
 	for {
@@ -152,4 +147,73 @@ func verifyBitDepthAndColorType(bd BitDepth, ct ColorType) error {
 	}
 
 	return nil
+}
+
+// TODO: Look into how to make this state changy shit not as gross
+// Transcode converts the current image Data to the target state data
+func (t *Transcoder) Transcode(target DataState) error {
+	if target == DataStateUnknown {
+		return fmt.Errorf("target DataState is unknown")
+	}
+
+	diff := int(target) - int(t.DataState)
+	if diff == 0 {
+		return nil
+	}
+
+	var err error
+	switch t.DataState {
+	case DataStateRaw:
+		if diff > 0 {
+			t.Data, err = t.Filterer.Filter(t.Data)
+			if err != nil {
+				return fmt.Errorf("error filtering: %w", err)
+			}
+			t.DataState = DataStateFiltered
+		} else {
+			return fmt.Errorf("cannot go down from DataStateRaw")
+		}
+	case DataStateFiltered:
+		if diff > 0 {
+			t.Data, err = t.interlacer.Interlace(t.Data)
+			if err != nil {
+				return fmt.Errorf("error interlacing: %w", err)
+			}
+			t.DataState = DataStateInterlaced
+		} else {
+			t.Data, err = t.Filterer.Unfilter(t.Data)
+			if err != nil {
+				return fmt.Errorf("error unfiltering: %w", err)
+			}
+			t.DataState = DataStateRaw
+		}
+	case DataStateInterlaced:
+		if diff > 0 {
+			t.Data, err = t.compressor.Compress(t.Data)
+			if err != nil {
+				return fmt.Errorf("error compressing: %w", err)
+			}
+			t.DataState = DataStateCompressed
+		} else {
+			t.Data, err = t.interlacer.Unterlace(t.Data)
+			if err != nil {
+				return fmt.Errorf("error unterlacing: %w", err)
+			}
+			t.DataState = DataStateFiltered
+		}
+	case DataStateCompressed:
+		if diff > 0 {
+			return fmt.Errorf("cannot go up from DataStateCompressed")
+		} else {
+			t.Data, err = t.compressor.Uncompress(t.Data)
+			if err != nil {
+				return fmt.Errorf("error uncompressing: %w", err)
+			}
+			t.DataState = DataStateInterlaced
+		}
+	default:
+		return fmt.Errorf("unknown DataState")
+	}
+
+	return t.Transcode(target)
 }

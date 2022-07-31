@@ -21,6 +21,16 @@ const (
 	BD16      BitDepth = 16
 )
 
+type DataState uint
+
+const (
+	DataStateUnknown DataState = iota
+	DataStateRaw
+	DataStateFiltered
+	DataStateInterlaced
+	DataStateCompressed
+)
+
 var (
 	PNG_SIGNATURE = []byte{137, 80, 78, 71, 13, 10, 26, 10}
 )
