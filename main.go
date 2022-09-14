@@ -2,12 +2,17 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	png "github.com/accrazed/png/src"
 )
 
 func main() {
-	t, err := png.NewTranscoder("png.png")
+	f, err := os.Open("png.png")
+	if err != nil {
+		panic(err)
+	}
+	t, err := png.NewTranscoder(f)
 	if err != nil {
 		panic(err)
 	}

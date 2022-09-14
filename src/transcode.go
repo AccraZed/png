@@ -13,16 +13,27 @@ type Transcoder struct {
 	Width, Height uint32
 	BitDepth      BitDepth
 	ColorType     ColorType
+	Interlace     InterlaceMethod // whether Adam7 Interlacer is used
 
 	// seenset keeps track of which index in data the ChunkTypes begin
 	// no support for multiple chunks of the same type yet
-	SeenSet   map[string]uint32
-	Data      []byte
-	DataState DataState
+	SeenSet    map[string][]uint32
+	DataChunks []*ImageData
+	DataState  DataState
 
 	Filterer   *AdaptiveFilter
 	compressor Compresser
-	interlacer Interlacer
+}
+type ImageData struct {
+	DataState DataState
+	data      []byte
+	Scanlines []Scanline
+}
+
+type Scanline struct {
+	pos       uint
+	numPixels uint
+	filter    FilterType
 }
 
 func (t *Transcoder) String() string {
@@ -30,11 +41,7 @@ func (t *Transcoder) String() string {
 		t.Width, t.Height, t.BitDepth, t.ColorType, t.SeenSet)
 }
 
-func NewTranscoder(path string) (*Transcoder, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("unable to open file: %v", err)
-	}
+func NewTranscoder(f *os.File) (*Transcoder, error) {
 	b, err := ioutil.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read file: %v", err)
@@ -47,9 +54,10 @@ func NewTranscoder(path string) (*Transcoder, error) {
 	//? todo: consider the very chaotic idea of making chunk processing
 	//? concurrent for the memes hehehe
 	t := &Transcoder{
-		SeenSet:   make(map[string]uint32),
+		SeenSet:   make(map[string][]uint32),
 		DataState: DataStateCompressed,
 	}
+	// Process raw data
 	var pos uint32 = 8
 	for {
 		if _, ok := t.SeenSet["IEND"]; ok {
@@ -75,59 +83,57 @@ func NewTranscoder(path string) (*Transcoder, error) {
 	return t, err
 }
 
-func (t *Transcoder) initChunk(loc uint32, typ, data, crc []byte) error {
-	if crc32.ChecksumIEEE(append(typ, data...)) != binary.BigEndian.Uint32(crc) {
+func (t *Transcoder) initChunk(loc uint32, typ, rawData, crc []byte) error {
+	if crc32.ChecksumIEEE(append(typ, rawData...)) != binary.BigEndian.Uint32(crc) {
 		return fmt.Errorf("crc32 failed for chunk %s (byte %v)", string(typ), loc)
 	}
 
 	switch string(typ) {
 	case "IHDR":
-		t.Width = binary.BigEndian.Uint32(data[:4])
-		t.Height = binary.BigEndian.Uint32(data[4:8])
+		t.Width = binary.BigEndian.Uint32(rawData[:4])
+		t.Height = binary.BigEndian.Uint32(rawData[4:8])
 
-		t.BitDepth = BitDepth(data[8])
-		t.ColorType = ColorType(data[9])
+		t.BitDepth = BitDepth(rawData[8])
+		t.ColorType = ColorType(rawData[9])
 		if err := verifyBitDepthAndColorType(t.BitDepth, t.ColorType); err != nil {
 			return err
 		}
 
 		// Compression method
-		switch data[10] {
+		switch rawData[10] {
 		case 0:
 			t.compressor = NewFlater()
 		default:
-			return fmt.Errorf("unsupported compressor type: %v", data[10])
+			return fmt.Errorf("unsupported compressor type: %v", rawData[10])
 		}
 
 		// Filter Method
-		switch data[11] {
+		switch rawData[11] {
 		case 0:
-			t.Filterer = &AdaptiveFilter{}
+			t.Filterer = &AdaptiveFilter{Width: t.Width}
 		default:
-			return fmt.Errorf("unsupported filter method: %v", data[11])
+			return fmt.Errorf("unsupported filter method: %v", rawData[11])
 		}
 
 		// Interlace method
-		switch data[12] {
-		case 0:
-			t.interlacer = NewNoInterlacer()
-		case 1:
-			t.interlacer = NewAdam7()
-		default:
-			return fmt.Errorf("unsupported interlace method : %v", data[12])
-		}
+		t.Interlace = InterlaceMethod(rawData[12])
+
 	case "IDAT":
 		if _, ok := t.SeenSet["IHDR"]; !ok {
 			return fmt.Errorf("IDAT header declared before IHDR")
 		}
-		t.Data = data
+		t.DataChunks = append(t.DataChunks, t.initImageData(rawData))
 	case "IEND":
 		// only seenset is updated
 	default:
 		fmt.Printf("WARNING: unimplemented type %s\n", string(typ))
 	}
 
-	t.SeenSet[string(typ)] = loc
+	if _, ok := t.SeenSet[string(typ)]; !ok {
+		t.SeenSet[string(typ)] = make([]uint32, 0)
+	}
+	t.SeenSet[string(typ)] = append(t.SeenSet[string(typ)], loc)
+
 	return nil
 }
 
@@ -149,71 +155,11 @@ func verifyBitDepthAndColorType(bd BitDepth, ct ColorType) error {
 	return nil
 }
 
-// TODO: Look into how to make this state changy shit not as gross
-// Transcode converts the current image Data to the target state data
-func (t *Transcoder) Transcode(target DataState) error {
-	if target == DataStateUnknown {
-		return fmt.Errorf("target DataState is unknown")
-	}
+func (t *Transcoder) initImageData(rawData []byte) *ImageData {
 
-	diff := int(target) - int(t.DataState)
-	if diff == 0 {
-		return nil
+	return &ImageData{
+		DataState: DataStateUnfiltered,
+		data:      rawData,
+		Scanlines: nil,
 	}
-
-	var err error
-	switch t.DataState {
-	case DataStateRaw:
-		if diff > 0 {
-			t.Data, err = t.Filterer.Filter(t.Data)
-			if err != nil {
-				return fmt.Errorf("error filtering: %w", err)
-			}
-			t.DataState = DataStateFiltered
-		} else {
-			return fmt.Errorf("cannot go down from DataStateRaw")
-		}
-	case DataStateFiltered:
-		if diff > 0 {
-			t.Data, err = t.interlacer.Interlace(t.Data)
-			if err != nil {
-				return fmt.Errorf("error interlacing: %w", err)
-			}
-			t.DataState = DataStateInterlaced
-		} else {
-			t.Data, err = t.Filterer.Unfilter(t.Data)
-			if err != nil {
-				return fmt.Errorf("error unfiltering: %w", err)
-			}
-			t.DataState = DataStateRaw
-		}
-	case DataStateInterlaced:
-		if diff > 0 {
-			t.Data, err = t.compressor.Compress(t.Data)
-			if err != nil {
-				return fmt.Errorf("error compressing: %w", err)
-			}
-			t.DataState = DataStateCompressed
-		} else {
-			t.Data, err = t.interlacer.Unterlace(t.Data)
-			if err != nil {
-				return fmt.Errorf("error unterlacing: %w", err)
-			}
-			t.DataState = DataStateFiltered
-		}
-	case DataStateCompressed:
-		if diff > 0 {
-			return fmt.Errorf("cannot go up from DataStateCompressed")
-		} else {
-			t.Data, err = t.compressor.Uncompress(t.Data)
-			if err != nil {
-				return fmt.Errorf("error uncompressing: %w", err)
-			}
-			t.DataState = DataStateInterlaced
-		}
-	default:
-		return fmt.Errorf("unknown DataState")
-	}
-
-	return t.Transcode(target)
 }

@@ -25,10 +25,28 @@ type DataState uint
 
 const (
 	DataStateUnknown DataState = iota
-	DataStateRaw
+	DataStateUnfiltered
 	DataStateFiltered
-	DataStateInterlaced
 	DataStateCompressed
+)
+
+type FilterType uint
+
+const (
+	FilterTypeUnknown DataState = iota
+	FilterTypeNone
+	FilterTypeSub
+	FilterTypeUp
+	FilterTypeAverage
+	FilterTypePaeth
+)
+
+type InterlaceMethod uint
+
+const (
+	InterlaceMethodUnknown InterlaceMethod = iota
+	InterlaceMethodNone
+	InterlaceMethodAdam7
 )
 
 var (

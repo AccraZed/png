@@ -7,8 +7,8 @@ import (
 )
 
 type Compresser interface {
-	Compress([]byte) ([]byte, error) // TODO: figure out signature
-	Uncompress([]byte) ([]byte, error)
+	Compress(*ImageData) (*ImageData, error) // TODO: figure out signature
+	Uncompress(*ImageData) (*ImageData, error)
 }
 
 type Flater struct{}
@@ -17,26 +17,29 @@ func NewFlater() Compresser {
 	return &Flater{}
 }
 
-func (*Flater) Compress(data []byte) ([]byte, error) {
+func (*Flater) Compress(id *ImageData) (*ImageData, error) {
 	b := bytes.Buffer{}
 	w := zlib.NewWriter(&b)
-	_, err := w.Write(data)
+	_, err := w.Write(id.data)
 	if err != nil {
 		return nil, err
 	}
+	id.data = b.Bytes()
 
-	return b.Bytes(), nil
+	return id, nil
 }
 
-func (*Flater) Uncompress(data []byte) ([]byte, error) {
-	r, err := zlib.NewReader(bytes.NewReader(data))
+func (*Flater) Uncompress(id *ImageData) (*ImageData, error) {
+	r, err := zlib.NewReader(bytes.NewReader(id.data))
 	if err != nil {
 		return nil, err
 	}
 	b := bytes.Buffer{}
 	io.Copy(&b, r)
 
-	return b.Bytes(), nil
+	id.data = b.Bytes()
+
+	return id, nil
 }
 
 var _ Compresser = (*Flater)(nil)
